@@ -214,3 +214,43 @@ pub(super) fn rollout_id_from_path_or_legacy_thread_id(
         }
     })
 }
+
+/// Locate an immutable rollout in the active or archived collection.
+pub(super) async fn resolve_rollout_path_by_id(
+    store: &LocalThreadStore,
+    rollout_id: ThreadId,
+) -> ThreadStoreResult<Option<PathBuf>> {
+    codex_rollout::find_rollout_path_by_rollout_id(store.config.codex_home.as_path(), rollout_id)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to locate rollout {rollout_id}: {err}"),
+        })
+}
+
+/// Read immutable metadata from a previously resolved representation.
+pub(super) async fn read_rollout_header(
+    store: &LocalThreadStore,
+    rollout_id: ThreadId,
+    mut path: PathBuf,
+) -> ThreadStoreResult<(PathBuf, codex_protocol::protocol::SessionMetaLine)> {
+    loop {
+        match codex_rollout::read_session_meta_line(path.as_path()).await {
+            Ok(meta) => return Ok((path, meta)),
+            Err(err) => {
+                // Before the header reveals its logical writer ID, archive can move this
+                // immutable rollout. Retry only after observing a different representation.
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && let Some(current_path) =
+                        resolve_rollout_path_by_id(store, rollout_id).await?
+                    && current_path != path
+                {
+                    path = current_path;
+                    continue;
+                }
+                return Err(ThreadStoreError::Internal {
+                    message: format!("failed to read rollout metadata {}: {err}", path.display()),
+                });
+            }
+        }
+    }
+}

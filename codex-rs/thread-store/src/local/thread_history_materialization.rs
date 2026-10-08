@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -7,6 +8,7 @@ use chrono::DateTime;
 use codex_app_server_protocol::ThreadHistoryChangeSet;
 use codex_app_server_protocol::project_rollout_line;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::HistoryPosition;
 use codex_rollout::RolloutItem;
 use tracing::warn;
 
@@ -19,15 +21,28 @@ use crate::ThreadStoreResult;
 const SQLITE_PROJECTION_METRIC: &str = "codex.thread_history.sqlite_projection";
 const SQLITE_PROJECTION_ANOMALY_METRIC: &str = "codex.thread_history.sqlite_projection.anomaly";
 
+#[derive(Clone, Copy)]
+pub(super) enum ProjectionLimit {
+    DurableEnd,
+    Through(HistoryPosition),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ProjectionSource<'a> {
+    Path(&'a Path),
+    ManagedRollout(ThreadId),
+}
+
 pub(super) async fn materialize_to_sqlite(
     store: &LocalThreadStore,
     thread_id: ThreadId,
-    rollout_path: &Path,
+    source: ProjectionSource<'_>,
+    limit: ProjectionLimit,
 ) -> ThreadStoreResult<()> {
     if store.state_db.is_none() {
         return Ok(());
     }
-    let result = materialize_to_sqlite_with_state_db(store, thread_id, rollout_path).await;
+    let result = materialize_to_sqlite_with_state_db(store, thread_id, source, limit).await;
     record_projection_outcome(&result);
     result
 }
@@ -35,23 +50,72 @@ pub(super) async fn materialize_to_sqlite(
 async fn materialize_to_sqlite_with_state_db(
     store: &LocalThreadStore,
     thread_id: ThreadId,
-    rollout_path: &Path,
+    source: ProjectionSource<'_>,
+    limit: ProjectionLimit,
 ) -> ThreadStoreResult<()> {
     let projection_state = super::thread_history::projection_state(store, thread_id).await?;
+    // A frozen ancestor must not depend on history appended after its retained prefix,
+    // including when its projection is rebuilt from scratch.
+    if let ProjectionLimit::Through(end) = limit
+        && projection_state.as_ref().is_some_and(|state| {
+            state.next_ordinal >= end.end_ordinal_exclusive
+                || state.next_byte_offset >= end.end_byte_offset
+        })
+    {
+        return Ok(());
+    }
+    // Callers hold the logical writer lock. Resolve managed files here, after the caught-up
+    // check, because archive may have invalidated the path captured during lineage resolution.
+    let mut rollout_path: Cow<'_, Path> = match source {
+        ProjectionSource::Path(path) => Cow::Borrowed(path),
+        ProjectionSource::ManagedRollout(logical_thread_id) => {
+            let current = super::thread_rollout_resolver::resolve_current_including_archived(
+                store,
+                logical_thread_id,
+            )
+            .await?;
+            let path = match current {
+                Some(current) if current.rollout_id == thread_id => Some(current.path),
+                // Older immutable ancestors need ID lookup; current writers and admitted
+                // metadata already provide the selected path without scanning the home.
+                Some(_) | None => {
+                    super::thread_rollout_resolver::resolve_rollout_path_by_id(store, thread_id)
+                        .await?
+                }
+            };
+            Cow::Owned(path.ok_or_else(|| ThreadStoreError::Internal {
+                message: format!("missing rollout {thread_id} during history recovery"),
+            })?)
+        }
+    };
     let start_offset = projection_state
         .as_ref()
         .map_or(0, |state| state.next_byte_offset);
     if projection_state.is_none()
-        && codex_rollout::existing_rollout_path(rollout_path)
+        && codex_rollout::existing_rollout_path(rollout_path.as_ref())
             .await
             .is_none()
     {
         return Ok(());
     }
-    let session_meta = codex_rollout::read_session_meta_line(rollout_path)
-        .await
-        .map_err(thread_store_io_error)?
-        .meta;
+    let session_meta = match source {
+        ProjectionSource::Path(_) => {
+            codex_rollout::read_session_meta_line(rollout_path.as_ref())
+                .await
+                .map_err(thread_store_io_error)?
+                .meta
+        }
+        ProjectionSource::ManagedRollout(_) => {
+            let (path, meta) = super::thread_rollout_resolver::read_rollout_header(
+                store,
+                thread_id,
+                rollout_path.into_owned(),
+            )
+            .await?;
+            rollout_path = Cow::Owned(path);
+            meta.meta
+        }
+    };
     let initial_ordinal = session_meta
         .history_base
         .map_or(0, |base| base.end_ordinal_exclusive);
@@ -60,11 +124,12 @@ async fn materialize_to_sqlite_with_state_db(
         .as_ref()
         .map_or(initial_ordinal, |state| state.next_ordinal);
     let (projections, next_offset) = read_projection_steps(
-        rollout_path,
+        rollout_path.as_ref(),
         start_offset,
         expected_ordinal,
         thread_id,
         subagent_history_start_ordinal,
+        limit,
     )
     .await?;
     // Empty valid records can still consume bytes through blank complete lines.
@@ -88,6 +153,7 @@ async fn read_projection_steps(
     expected_ordinal: u64,
     thread_id: ThreadId,
     subagent_history_start_ordinal: Option<u64>,
+    limit: ProjectionLimit,
 ) -> ThreadStoreResult<(Vec<RolloutProjectionStep>, u64)> {
     let path = rollout_path.to_path_buf();
     let span = tracing::Span::current();
@@ -99,6 +165,7 @@ async fn read_projection_steps(
             expected_ordinal,
             thread_id,
             subagent_history_start_ordinal,
+            limit,
         )
     })
     .await
@@ -114,6 +181,7 @@ fn read_projection_steps_sync(
     expected_ordinal: u64,
     thread_id: ThreadId,
     subagent_history_start_ordinal: Option<u64>,
+    limit: ProjectionLimit,
 ) -> ThreadStoreResult<(Vec<RolloutProjectionStep>, u64)> {
     let mut file = match codex_rollout::open_rollout_seekable_reader(rollout_path) {
         Ok(file) => file,
@@ -123,12 +191,15 @@ fn read_projection_steps_sync(
         Err(err) => return Err(thread_store_io_error(err)),
     };
     let file_end_offset = file.metadata().map_err(thread_store_io_error)?.len();
-    let byte_count =
-        file_end_offset
-            .checked_sub(start_offset)
-            .ok_or_else(|| ThreadStoreError::Internal {
-                message: "durable rollout shrank before projection".to_string(),
-            })?;
+    let projection_end_offset = match limit {
+        ProjectionLimit::DurableEnd => file_end_offset,
+        ProjectionLimit::Through(end) => end.end_byte_offset,
+    };
+    let byte_count = projection_end_offset
+        .checked_sub(start_offset)
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: "durable rollout shrank before projection".to_string(),
+        })?;
     let byte_count = usize::try_from(byte_count).map_err(|_| ThreadStoreError::Internal {
         message: "durable rollout append exceeds addressable memory".to_string(),
     })?;

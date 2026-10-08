@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::super::LocalThreadStore;
+use super::read::prepare_history_lineage;
 use super::read::validate_thread_for_paginated_reads;
 use super::segment_paging::validate_page_size;
 use super::sqlite_integer;
@@ -52,9 +53,7 @@ pub(in crate::local) async fn list_timeline(
     .await?;
     validate_page_size(params.page_size)?;
 
-    let lineage = store
-        .resolve_rollout_lineage(params.thread_id, /*initial_path*/ None)
-        .await?;
+    let lineage = prepare_history_lineage(store, params.thread_id).await?;
     let pool = store.thread_history_db().await?;
     let cursor = params
         .cursor

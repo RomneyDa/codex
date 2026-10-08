@@ -13,6 +13,8 @@ use tracing::warn;
 
 use super::LocalThreadStore;
 use super::create_thread;
+use super::thread_history_materialization::ProjectionLimit;
+use super::thread_history_materialization::ProjectionSource;
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::ResumeThreadParams;
@@ -181,7 +183,8 @@ pub(super) async fn shutdown_thread(
         if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
             store,
             rollout_id,
-            rollout_path.as_path(),
+            ProjectionSource::Path(rollout_path.as_path()),
+            ProjectionLimit::DurableEnd,
         )
         .await
         {
@@ -356,7 +359,8 @@ async fn write_and_project(
         if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
             store,
             rollout_id,
-            rollout_path,
+            ProjectionSource::Path(rollout_path),
+            ProjectionLimit::DurableEnd,
         )
         .await
         {

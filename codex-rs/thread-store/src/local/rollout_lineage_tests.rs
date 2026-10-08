@@ -59,6 +59,24 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
         /*history_base*/ None,
         /*next_ordinal*/ 6,
     );
+    // Revert preserves the logical writer ID but assigns a new immutable rollout ID.
+    let root_thread_id = ThreadId::default();
+    let rollout = fs::read_to_string(&root_path).expect("read ancestor rollout");
+    let (meta, rest) = rollout.split_once('\n').expect("ancestor metadata");
+    let mut meta =
+        codex_rollout::parse_rollout_line_bytes(meta.as_bytes()).expect("parse metadata");
+    let RolloutItem::SessionMeta(session_meta) = &mut meta.item else {
+        panic!("expected ancestor session metadata");
+    };
+    session_meta.meta.id = root_thread_id;
+    fs::write(
+        &root_path,
+        format!(
+            "{}\n{rest}",
+            serde_json::to_string(&meta).expect("serialize metadata")
+        ),
+    )
+    .expect("write reverted ancestor metadata");
     let root_end = history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 4);
     let middle_path = write_rollout(home.path(), middle, Some(root_end), /*next_ordinal*/ 1);
     let middle_end = history_position(
@@ -82,18 +100,21 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
         lineage.segments,
         vec![
             RolloutLineageSegment {
+                thread_id: root_thread_id,
                 rollout_id: root,
                 rollout_path: root_path.clone(),
                 start_ordinal: 1,
                 end: Some(root_end),
             },
             RolloutLineageSegment {
+                thread_id: middle,
                 rollout_id: middle,
                 rollout_path: middle_path.clone(),
                 start_ordinal: 5,
                 end: Some(middle_end),
             },
             RolloutLineageSegment {
+                thread_id: child,
                 rollout_id: child,
                 rollout_path: child_path,
                 start_ordinal: 6,
@@ -166,12 +187,14 @@ async fn resolves_lineage_at_explicit_history_position() {
         lineage.segments,
         vec![
             RolloutLineageSegment {
+                thread_id: root,
                 rollout_id: root,
                 rollout_path: root_path.clone(),
                 start_ordinal: 1,
                 end: Some(root_end),
             },
             RolloutLineageSegment {
+                thread_id: child,
                 rollout_id: child,
                 rollout_path: child_path.clone(),
                 start_ordinal: 5,
