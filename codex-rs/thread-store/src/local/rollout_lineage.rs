@@ -14,6 +14,8 @@ use crate::ThreadStoreResult;
 /// One immutable rollout range contributing to a paginated thread's history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RolloutLineageSegment {
+    // Revert changes the immutable rollout ID, not the logical writer's coordination ID.
+    pub(super) thread_id: ThreadId,
     pub(super) rollout_id: ThreadId,
     pub(super) rollout_path: PathBuf,
     pub(super) start_ordinal: u64,
@@ -67,18 +69,21 @@ impl LocalThreadStore {
         let mut end = None;
 
         loop {
-            let coordination_id = next_rollout_id.unwrap_or(requested_thread_id);
-            let _writer_guard = match representation {
-                LineageRepresentation::Existing => None,
-                LineageRepresentation::PlainForReference => {
-                    Some(self.live_writer_locks.lock(coordination_id).await)
+            let _current_writer_guard = match (representation, next_rollout_id) {
+                (LineageRepresentation::PlainForReference, None) => {
+                    Some(self.live_writer_locks.lock(requested_thread_id).await)
                 }
+                (LineageRepresentation::Existing, _)
+                | (LineageRepresentation::PlainForReference, Some(_)) => None,
             };
-            let (rollout_id, rollout_path) = match (next_rollout_id, initial_path.take()) {
+            let (rollout_id, mut rollout_path) = match (next_rollout_id, initial_path.take()) {
                 (Some(rollout_id), _) => {
-                    let rollout_path = resolve_rollout_path_by_id(self, rollout_id)
-                        .await?
-                        .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
+                    let rollout_path =
+                        thread_rollout_resolver::resolve_rollout_path_by_id(self, rollout_id)
+                            .await?
+                            .ok_or_else(|| {
+                                malformed_lineage(rollout_id, "missing source rollout")
+                            })?;
                     (rollout_id, rollout_path)
                 }
                 (None, Some(path)) => {
@@ -104,6 +109,25 @@ impl LocalThreadStore {
             };
             if !seen.insert(rollout_id) {
                 return Err(malformed_lineage(requested_thread_id, "cycle detected"));
+            }
+            let (resolved_path, meta) =
+                thread_rollout_resolver::read_rollout_header(self, rollout_id, rollout_path)
+                    .await?;
+            rollout_path = resolved_path;
+            let ancestor_writer_guard = match (representation, next_rollout_id) {
+                (LineageRepresentation::PlainForReference, Some(_)) => {
+                    Some(self.live_writer_locks.lock(meta.meta.id).await)
+                }
+                (LineageRepresentation::Existing, _)
+                | (LineageRepresentation::PlainForReference, None) => None,
+            };
+            if ancestor_writer_guard.is_some() {
+                // Archive can move an ancestor while its immutable metadata reveals the logical
+                // writer ID. Resolve its representation again while holding that writer's lock.
+                rollout_path =
+                    thread_rollout_resolver::resolve_rollout_path_by_id(self, rollout_id)
+                        .await?
+                        .ok_or_else(|| malformed_lineage(rollout_id, "missing source rollout"))?;
             }
             let rollout_path = match representation {
                 LineageRepresentation::Existing => rollout_path,
@@ -134,14 +158,6 @@ impl LocalThreadStore {
                     canonical_rollout_path
                 }
             };
-            let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!(
-                        "failed to read lineage metadata {}: {err}",
-                        rollout_path.display()
-                    ),
-                })?;
             if next_rollout_id.is_none() && meta.meta.id != requested_thread_id {
                 return Err(malformed_lineage(
                     requested_thread_id,
@@ -184,6 +200,7 @@ impl LocalThreadStore {
                 None => 1,
             };
             segments.push(RolloutLineageSegment {
+                thread_id: meta.meta.id,
                 rollout_id,
                 rollout_path,
                 start_ordinal,
@@ -200,17 +217,6 @@ impl LocalThreadStore {
         segments.reverse();
         Ok(RolloutLineage { segments })
     }
-}
-
-async fn resolve_rollout_path_by_id(
-    store: &LocalThreadStore,
-    rollout_id: ThreadId,
-) -> ThreadStoreResult<Option<PathBuf>> {
-    codex_rollout::find_rollout_path_by_rollout_id(store.config.codex_home.as_path(), rollout_id)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to locate rollout {rollout_id}: {err}"),
-        })
 }
 
 #[derive(Clone, Copy)]

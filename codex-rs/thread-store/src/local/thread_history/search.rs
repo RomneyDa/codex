@@ -15,6 +15,7 @@ use sqlx::Row;
 
 use super::super::LocalThreadStore;
 use super::read::CursorScope;
+use super::read::prepare_history_lineage;
 use super::read::serialize_cursor;
 use super::read::validate_thread_for_paginated_reads;
 use super::sqlite_integer;
@@ -74,9 +75,7 @@ pub(in crate::local) async fn search_thread_occurrences(
         &params.search_term,
     )?;
     let matcher = LiteralMatcher::new(params.search_term.as_str());
-    let lineage = store
-        .resolve_rollout_lineage(params.thread_id, /*initial_path*/ None)
-        .await?;
+    let lineage = prepare_history_lineage(store, params.thread_id).await?;
     let cursor_segment = cursor
         .as_ref()
         .map(|cursor| {

@@ -6,6 +6,8 @@ use super::live_writer;
 use super::model_context;
 use super::thread_history::find_source_turn;
 use super::thread_history::find_visible_turn;
+use super::thread_history_materialization::ProjectionLimit;
+use super::thread_history_materialization::ProjectionSource;
 use crate::ForkBoundary;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
@@ -55,11 +57,14 @@ pub(super) async fn prepare(
             .iter()
             .take(lineage.segments().len().saturating_sub(1))
         {
-            let _ancestor_writer_guard = store.live_writer_locks.lock(segment.rollout_id()).await;
+            let _ancestor_writer_guard = store.live_writer_locks.lock(segment.thread_id).await;
             super::thread_history_materialization::materialize_to_sqlite(
                 store,
                 segment.rollout_id(),
-                segment.rollout_path.as_path(),
+                ProjectionSource::ManagedRollout(segment.thread_id),
+                segment
+                    .end
+                    .map_or(ProjectionLimit::DurableEnd, ProjectionLimit::Through),
             )
             .await?;
         }
@@ -68,7 +73,8 @@ pub(super) async fn prepare(
     super::thread_history_materialization::materialize_to_sqlite(
         store,
         source_segment.rollout_id(),
-        source_segment.rollout_path.as_path(),
+        ProjectionSource::ManagedRollout(thread_id),
+        ProjectionLimit::DurableEnd,
     )
     .await?;
 

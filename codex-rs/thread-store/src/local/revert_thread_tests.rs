@@ -18,7 +18,9 @@ use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
+use crate::ForkBoundary;
 use crate::ListTurnsParams;
+use crate::PrepareForkParams;
 use crate::RevertThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
@@ -106,9 +108,8 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         replacement_meta.runtime_workspace_roots,
         Some(vec![home.path().join("workspace")])
     );
-    assert_eq!(turn_ids(&store, thread_id).await, vec!["turn-1"]);
-
-    // Simulate an older binary replacing the rollout without the creator fields it does not know.
+    // Simulate an older binary's replacement before a reader projects its immutable byte offsets.
+    // Rewriting an already-projected rollout would instead invalidate those offsets.
     let rollout = tokio::fs::read_to_string(&first_replacement_path)
         .await
         .expect("read replacement rollout");
@@ -125,6 +126,16 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
     )
     .await
     .expect("write legacy replacement rollout");
+    assert_eq!(turn_ids(&store, thread_id).await, vec!["turn-1"]);
+    let prepared = store
+        .prepare_fork(PrepareForkParams {
+            thread_id,
+            boundary: ForkBoundary::ThroughTurn("turn-1".to_string()),
+        })
+        .await
+        .expect("prepare a named fork of the reverted thread");
+    assert_eq!(prepared.history_base, replacement_meta.history_base);
+    drop(prepared);
 
     store
         .revert_thread(RevertThreadParams {

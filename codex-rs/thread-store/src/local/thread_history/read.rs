@@ -6,6 +6,8 @@ use sqlx::Row;
 
 use super::super::LocalThreadStore;
 use super::super::rollout_lineage::RolloutLineage;
+use super::super::thread_history_materialization::ProjectionLimit;
+use super::super::thread_history_materialization::ProjectionSource;
 use super::segment_paging::page_item_rows;
 use super::segment_paging::page_turn_rows;
 use super::segment_paging::validate_page_size;
@@ -111,9 +113,7 @@ pub(in crate::local) async fn list_turns(
     )
     .await?;
     validate_page_size(params.page_size)?;
-    let lineage = store
-        .resolve_rollout_lineage(params.thread_id, /*initial_path*/ None)
-        .await?;
+    let lineage = prepare_history_lineage(store, params.thread_id).await?;
     let pool = store.thread_history_db().await?;
     let page = page_turn_rows(
         pool,
@@ -172,9 +172,7 @@ pub(in crate::local) async fn list_items(
     )
     .await?;
     validate_page_size(params.page_size)?;
-    let lineage = store
-        .resolve_rollout_lineage(params.thread_id, /*initial_path*/ None)
-        .await?;
+    let lineage = prepare_history_lineage(store, params.thread_id).await?;
     let pool = store.thread_history_db().await?;
     let page = page_item_rows(pool, &lineage, &params).await?;
 
@@ -213,6 +211,30 @@ pub(super) async fn validate_thread_for_paginated_reads(
         ThreadHistoryMode::Legacy => Err(ThreadStoreError::Unsupported { operation }),
         ThreadHistoryMode::Paginated => Ok(()),
     }
+}
+
+pub(super) async fn prepare_history_lineage(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<RolloutLineage> {
+    let lineage = store
+        .resolve_rollout_lineage(thread_id, /*initial_path*/ None)
+        .await?;
+    // Durable writes can succeed while SQLite projection fails. Readers must catch up even
+    // without a live recorder, and propagate failure instead of presenting stale history.
+    for segment in lineage.segments() {
+        let _writer_guard = store.live_writer_locks.lock(segment.thread_id).await;
+        super::super::thread_history_materialization::materialize_to_sqlite(
+            store,
+            segment.rollout_id(),
+            ProjectionSource::ManagedRollout(segment.thread_id),
+            segment
+                .end
+                .map_or(ProjectionLimit::DurableEnd, ProjectionLimit::Through),
+        )
+        .await?;
+    }
+    Ok(lineage)
 }
 
 async fn load_inherited_summary_items(

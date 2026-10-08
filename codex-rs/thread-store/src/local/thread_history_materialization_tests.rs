@@ -51,16 +51,24 @@ use tempfile::TempDir;
 use super::super::LocalThreadStore;
 use super::super::LocalThreadStoreConfig;
 use super::super::test_support::test_config;
+use super::ProjectionLimit::DurableEnd;
+use super::ProjectionSource;
+use super::ProjectionSource::Path as RolloutPath;
 use crate::AppendThreadItemsParams;
+use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ForkBoundary;
+use crate::ItemSortKey;
+use crate::ListItemsParams;
 use crate::ListThreadsParams;
+use crate::ListTimelineParams;
 use crate::ListTurnsParams;
 use crate::PersistContext;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ResumeThreadParams;
+use crate::SearchThreadOccurrencesParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
 use crate::StoredTurnStatus;
@@ -736,9 +744,14 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
         .execute(&pool)
         .await
         .expect("rewind projection checkpoint");
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("replay canonical rollout");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("replay canonical rollout");
 
     let replayed_rows = sqlx::query_as::<_, (String, i64, i64, String)>(
         "SELECT item_id, rollout_ordinal, created_at_ms, item_type FROM thread_realtime_items WHERE thread_id = ? ORDER BY rollout_ordinal",
@@ -929,6 +942,102 @@ async fn referenced_paginated_rollout_projects_inherited_ordinal_range() {
     .await
     .expect("read child projection ordinal");
     assert_eq!((turn_ordinal, next_ordinal), (5, 8));
+
+    let mut metadata = codex_state::ThreadMetadataBuilder::new(
+        child_id,
+        store
+            .live_rollout_path(child_id)
+            .await
+            .expect("child rollout"),
+        Utc::now(),
+        SessionSource::Exec,
+    );
+    metadata.history_mode = ThreadHistoryMode::Paginated;
+    store
+        .state_db
+        .as_ref()
+        .expect("metadata database")
+        .upsert_thread(&metadata.build(store.config.default_model_provider_id.as_str()))
+        .await
+        .expect("admit child history reader");
+    sqlx::query("CREATE TRIGGER fail_ancestor_suffix BEFORE INSERT ON thread_turns WHEN NEW.turn_id = 'later-source-turn' BEGIN SELECT RAISE(ABORT, 'failed ancestor suffix'); END")
+        .execute(&pool).await.expect("block ancestor suffix indexing");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_id,
+            items: vec![
+                turn_started("later-source-turn"),
+                turn_completed("later-source-turn"),
+            ],
+        })
+        .await
+        .expect("persist ancestor suffix outside the child prefix");
+    sqlx::query("DELETE FROM thread_history_projection_state WHERE thread_id = ?")
+        .bind(source_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("rebuild the ancestor projection from its retained prefix");
+    sqlx::query("DELETE FROM thread_turns WHERE thread_id = ?")
+        .bind(source_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("remove ancestor turn projection for the rebuild");
+    store
+        .shutdown_thread(source_id)
+        .await
+        .expect("close ancestor writer");
+    store
+        .archive_thread(ArchiveThreadParams {
+            thread_id: source_id,
+        })
+        .await
+        .expect("archive ancestor after its active path was resolved");
+    let (archived_path, archived_meta) =
+        super::super::thread_rollout_resolver::read_rollout_header(
+            &store,
+            source_id,
+            source_path.clone(),
+        )
+        .await
+        .expect("discover ancestor metadata after its resolved path moved");
+    assert_eq!(archived_meta.meta.id, source_id);
+    assert_ne!(archived_path, source_path);
+    let ancestor_writer_guard = store.live_writer_locks.lock(source_id).await;
+    super::materialize_to_sqlite(
+        &store,
+        source_id,
+        ProjectionSource::ManagedRollout(source_id),
+        super::ProjectionLimit::Through(history_base),
+    )
+    .await
+    .expect("recover the retained prefix after the ancestor moved");
+    drop(ancestor_writer_guard);
+    assert_eq!(
+        projection_state(&pool, source_id).await,
+        (
+            i64::try_from(history_base.end_byte_offset).expect("prefix byte offset"),
+            i64::try_from(history_base.end_ordinal_exclusive).expect("prefix ordinal"),
+        )
+    );
+    let turns = store
+        .list_turns(ListTurnsParams {
+            thread_id: child_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await
+        .expect("a frozen fork does not depend on newer ancestor indexing");
+    assert_eq!(
+        turns
+            .turns
+            .into_iter()
+            .map(|turn| turn.turn_id)
+            .collect::<Vec<_>>(),
+        vec!["source-turn".to_string(), "child-turn".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -2011,9 +2120,14 @@ async fn paginated_projection_accepts_float_rate_limits_and_later_final_answers(
         .expect("queue unprojected history");
     recorder.flush().await.expect("flush unprojected history");
     assert_eq!(projection_state(&pool, thread_id).await, checkpoint);
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("project floating-point rate limits");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("project floating-point rate limits");
 
     store
         .append_items(AppendThreadItemsParams {
@@ -2189,9 +2303,14 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
         .live_rollout_path(thread_id)
         .await
         .expect("rollout path");
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("catch up synchronized rollout");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("catch up synchronized rollout");
 
     assert_eq!(projection_state(&pool, thread_id).await, before);
     let status =
@@ -2232,9 +2351,14 @@ async fn catch_up_preserves_trailing_partial_line_boundaries() {
         format!("{complete_suffix}{partial_line}").as_str(),
     );
 
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("catch up complete suffix");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("catch up complete suffix");
 
     let expected_offset =
         before.0 + i64::try_from(complete_suffix.len()).expect("complete suffix byte count");
@@ -2243,9 +2367,14 @@ async fn catch_up_preserves_trailing_partial_line_boundaries() {
         (expected_offset, 2)
     );
     append_suffix(rollout_path.as_path(), "\n");
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("catch up completed partial suffix");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("catch up completed partial suffix");
 
     let rollout_len = i64::try_from(fs::metadata(rollout_path).expect("rollout metadata").len())
         .expect("rollout length");
@@ -2312,9 +2441,14 @@ async fn catch_up_skips_invalid_complete_suffixes_and_projects_later_history() {
             .expect("rollout path");
         append_suffix(rollout_path.as_path(), suffix.as_str());
 
-        super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-            .await
-            .expect(name);
+        super::materialize_to_sqlite(
+            &store,
+            thread_id,
+            RolloutPath(rollout_path.as_path()),
+            DurableEnd,
+        )
+        .await
+        .expect(name);
 
         let expected_offset = before.0 + i64::try_from(suffix.len()).expect("suffix byte count");
         assert_eq!(
@@ -2376,9 +2510,14 @@ async fn catch_up_rejects_missing_rollout_after_projection() {
         .expect("close rollout");
     fs::remove_file(rollout_path.as_path()).expect("remove rollout");
 
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect_err("missing projected rollout should fail");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect_err("missing projected rollout should fail");
 }
 
 #[tokio::test]
@@ -2412,6 +2551,165 @@ async fn sqlite_failure_does_not_fail_durable_jsonl_write() {
                 if event.turn_id == "turn-1"
         )
     }));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistoryReader {
+    Turns,
+    Items,
+    Timeline,
+    Search,
+}
+
+impl HistoryReader {
+    async fn read(
+        self,
+        store: &LocalThreadStore,
+        thread_id: ThreadId,
+    ) -> crate::ThreadStoreResult<usize> {
+        match self {
+            Self::Turns => store
+                .list_turns(ListTurnsParams {
+                    thread_id,
+                    include_archived: false,
+                    cursor: None,
+                    page_size: 10,
+                    sort_direction: SortDirection::Asc,
+                    items_view: StoredTurnItemsView::Summary,
+                })
+                .await
+                .map(|page| page.turns.len()),
+            Self::Items => store
+                .list_items(ListItemsParams {
+                    thread_id,
+                    turn_id: None,
+                    include_archived: false,
+                    position: None,
+                    page_size: 10,
+                    sort_direction: SortDirection::Asc,
+                    sort_key: ItemSortKey::CreatedAtOrdinal,
+                    after_updated_at_ordinal: None,
+                })
+                .await
+                .map(|page| page.items.len()),
+            Self::Timeline => store
+                .list_timeline(ListTimelineParams {
+                    thread_id,
+                    cursor: None,
+                    page_size: 10,
+                })
+                .await
+                .map(|page| page.items.len()),
+            Self::Search => store
+                .search_thread_occurrences(SearchThreadOccurrencesParams {
+                    thread_id,
+                    search_term: "recoverable".to_string(),
+                    cursor: None,
+                    page_size: 10,
+                })
+                .await
+                .map(|page| page.items.len()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_readers_recover_durable_turn_after_failed_projection() {
+    for reader in [
+        HistoryReader::Turns,
+        HistoryReader::Items,
+        HistoryReader::Timeline,
+        HistoryReader::Search,
+    ] {
+        for cold in [false, true] {
+            let home = TempDir::new().expect("temp dir");
+            let mut store = projection_store(home.path()).await;
+            let thread_id = ThreadId::default();
+            create_paginated_thread(&store, thread_id).await;
+            store
+                .persist_thread(thread_id, PersistContext::Standard)
+                .await
+                .expect("persist metadata");
+            let mut metadata = codex_state::ThreadMetadataBuilder::new(
+                thread_id,
+                store
+                    .live_rollout_path(thread_id)
+                    .await
+                    .expect("rollout path"),
+                Utc::now(),
+                SessionSource::Exec,
+            );
+            metadata.history_mode = ThreadHistoryMode::Paginated;
+            store
+                .state_db
+                .as_ref()
+                .expect("metadata database")
+                .upsert_thread(&metadata.build(store.config.default_model_provider_id.as_str()))
+                .await
+                .expect("admit thread before blocking history indexing");
+            let pool = codex_state::open_thread_history_db(&store.config.sqlite)
+                .await
+                .expect("history database");
+            sqlx::query("CREATE TRIGGER fail_projection BEFORE INSERT ON thread_turns BEGIN SELECT RAISE(ABORT, 'failed projection'); END")
+                .execute(&pool).await.expect("block projection");
+            store
+                .append_items(AppendThreadItemsParams {
+                    thread_id,
+                    items: vec![
+                        turn_started("turn-1"),
+                        completed_item(
+                            thread_id,
+                            "turn-1",
+                            TurnItem::AgentMessage(AgentMessageItem {
+                                id: "agent-1".to_string(),
+                                content: vec![AgentMessageContent::Text {
+                                    text: "recoverable".to_string(),
+                                }],
+                                phase: None,
+                                memory_citation: None,
+                                delivery: None,
+                                questions: None,
+                            }),
+                        ),
+                        turn_completed("turn-1"),
+                    ],
+                })
+                .await
+                .expect("canonical write succeeds despite failed indexing");
+            if cold {
+                store
+                    .shutdown_thread(thread_id)
+                    .await
+                    .expect("shutdown with indexing still blocked");
+                drop(store);
+                store = projection_store(home.path()).await;
+            }
+            let error = reader
+                .read(&store, thread_id)
+                .await
+                .expect_err("failed catch-up must not look like empty history");
+            assert!(
+                error.to_string().contains("failed projection"),
+                "{reader:?}, cold={cold}: {error}"
+            );
+            sqlx::query("DROP TRIGGER fail_projection")
+                .execute(&pool)
+                .await
+                .expect("restore indexing");
+            let expected = match reader {
+                HistoryReader::Timeline => 3,
+                HistoryReader::Turns | HistoryReader::Items | HistoryReader::Search => 1,
+            };
+            assert_eq!(
+                reader
+                    .read(&store, thread_id)
+                    .await
+                    .expect("recover on read without another write"),
+                expected,
+                "{reader:?}, cold={cold}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2448,9 +2746,14 @@ async fn blank_and_rejected_rollout_lines_advance_projection() {
             .len(),
     )
     .expect("rollout length");
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("skip rejected tail");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("skip rejected tail");
     assert_eq!(
         projection_state(&pool, thread_id).await,
         (rejected_tail_len, before.1)
@@ -2470,9 +2773,14 @@ async fn blank_and_rejected_rollout_lines_advance_projection() {
         .expect("queue valid retry");
     recorder.flush().await.expect("flush valid retry");
 
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("project valid retry after rejected line");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("project valid retry after rejected line");
 
     let (expected_start_byte_offset, _) =
         rollout_line_byte_offsets(rollout_path.as_path(), /*ordinal*/ 1);
@@ -2523,15 +2831,79 @@ async fn unknown_rollout_lines_leave_ordinals_pending_for_valid_retries() {
     let pending_line = unknown_line(1);
     append_suffix(rollout_path.as_path(), format!("{pending_line}\n").as_str());
 
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("skip unknown tail");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("skip unknown tail");
     let expected_pending_offset =
         before.0 + i64::try_from(pending_line.len() + 1).expect("pending line byte count");
     assert_eq!(
         projection_state(&pool, thread_id).await,
         (expected_pending_offset, 1)
     );
+
+    // A newer binary can freeze a child after a record this reader does not understand.
+    let child_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &store,
+        child_id,
+        Some(HistoryPosition {
+            thread_id,
+            end_ordinal_exclusive: 2,
+            end_byte_offset: u64::try_from(expected_pending_offset).expect("prefix byte offset"),
+        }),
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    store
+        .persist_thread(child_id, PersistContext::Standard)
+        .await
+        .expect("persist child");
+    let mut metadata = codex_state::ThreadMetadataBuilder::new(
+        child_id,
+        store
+            .live_rollout_path(child_id)
+            .await
+            .expect("child rollout"),
+        Utc::now(),
+        SessionSource::Exec,
+    );
+    metadata.history_mode = ThreadHistoryMode::Paginated;
+    store
+        .state_db
+        .as_ref()
+        .expect("metadata database")
+        .upsert_thread(&metadata.build(store.config.default_model_provider_id.as_str()))
+        .await
+        .expect("admit child reader");
+    append_suffix(
+        rollout_path.as_path(),
+        format!("{}\n", unknown_line(2)).as_str(),
+    );
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("consume another unknown record beyond the child prefix");
+    let child_turns = store
+        .list_turns(ListTurnsParams {
+            thread_id: child_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::NotLoaded,
+        })
+        .await
+        .expect("consumed unknown ancestor records do not make the frozen prefix shrink");
+    assert!(child_turns.turns.is_empty());
 
     append_suffix(
         rollout_path.as_path(),
@@ -2544,9 +2916,14 @@ async fn unknown_rollout_lines_leave_ordinals_pending_for_valid_retries() {
         .as_str(),
     );
 
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("project valid retry and later history");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("project valid retry and later history");
 
     let rollout_len = i64::try_from(fs::metadata(rollout_path).expect("rollout metadata").len())
         .expect("rollout length");
@@ -2599,9 +2976,14 @@ async fn event_timestamps_allow_invalid_rollout_timestamps() {
         .as_str(),
     );
 
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("project records with event timestamps");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("project records with event timestamps");
 
     let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
         home.path().abs(),
@@ -2647,9 +3029,14 @@ async fn malformed_rollout_lines_skip_inferred_ordinal_gaps() {
         .as_str(),
     );
 
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-        .await
-        .expect("skip malformed gap and project later history");
+    super::materialize_to_sqlite(
+        &store,
+        thread_id,
+        RolloutPath(rollout_path.as_path()),
+        DurableEnd,
+    )
+    .await
+    .expect("skip malformed gap and project later history");
 
     let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
         home.path().abs(),

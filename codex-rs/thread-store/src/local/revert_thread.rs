@@ -6,6 +6,8 @@ use codex_rollout::RolloutRecorderParams;
 
 use super::LocalThreadStore;
 use super::paginated_fork;
+use super::thread_history_materialization::ProjectionLimit;
+use super::thread_history_materialization::ProjectionSource;
 use super::thread_rollout_resolver;
 use crate::ForkBoundary;
 use crate::RevertThreadParams;
@@ -83,6 +85,11 @@ pub(super) async fn revert(
         .resolve_rollout_lineage(thread_id, /*initial_path*/ None)
         .await?;
     for segment in &mut lineage.segments {
+        let _ancestor_writer_guard = if segment.thread_id != thread_id {
+            Some(store.live_writer_locks.lock(segment.thread_id).await)
+        } else {
+            None
+        };
         if segment.rollout_id() == current_rollout.rollout_id && source_meta.history_base.is_none()
         {
             segment.rollout_path =
@@ -98,7 +105,10 @@ pub(super) async fn revert(
         super::thread_history_materialization::materialize_to_sqlite(
             store,
             segment.rollout_id(),
-            segment.rollout_path.as_path(),
+            ProjectionSource::ManagedRollout(segment.thread_id),
+            segment
+                .end
+                .map_or(ProjectionLimit::DurableEnd, ProjectionLimit::Through),
         )
         .await?;
     }
